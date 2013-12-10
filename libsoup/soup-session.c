@@ -117,7 +117,6 @@ typedef struct {
 	GHashTable *features_cache;
 
 	GHashTable *http_hosts, *https_hosts; /* char* -> SoupSessionHost */
-	GHashTable *conns; /* SoupConnection -> SoupSessionHost */
 	guint num_conns;
 	guint max_conns, max_conns_per_host;
 
@@ -146,8 +145,7 @@ typedef struct {
 static void connection_state_changed (GObject *object, GParamSpec *param,
 				      gpointer user_data);
 static void connection_disconnected (SoupConnection *conn, gpointer user_data);
-static void drop_connection (SoupSession *session, SoupSessionHost *host,
-			     SoupConnection *conn);
+static void drop_connection (SoupSession *session, SoupConnection *conn);
 
 static void auth_manager_authenticate (SoupAuthManager *manager,
 				       SoupMessage *msg, SoupAuth *auth,
@@ -229,7 +227,6 @@ soup_session_init (SoupSession *session)
 	priv->https_hosts = g_hash_table_new_full (soup_host_uri_hash,
 						   soup_host_uri_equal,
 						   NULL, g_object_unref);
-	priv->conns = g_hash_table_new (NULL, NULL);
 
 	priv->max_conns = SOUP_SESSION_MAX_CONNS_DEFAULT;
 	priv->max_conns_per_host = SOUP_SESSION_MAX_CONNS_PER_HOST_DEFAULT;
@@ -318,7 +315,6 @@ soup_session_dispose (GObject *object)
 
 	priv->disposed = TRUE;
 	soup_session_abort (session);
-	g_warn_if_fail (g_hash_table_size (priv->conns) == 0);
 
 	while (priv->features)
 		soup_session_remove_feature (session, priv->features->data);
@@ -338,7 +334,6 @@ soup_session_finalize (GObject *object)
 	g_cond_clear (&priv->conn_cond);
 	g_hash_table_destroy (priv->http_hosts);
 	g_hash_table_destroy (priv->https_hosts);
-	g_hash_table_destroy (priv->conns);
 
 	g_free (priv->user_agent);
 	g_free (priv->accept_language);
@@ -1297,38 +1292,64 @@ soup_session_send_queue_item (SoupSession *session,
 		soup_connection_send_request (item->conn, item, completion_cb, item);
 }
 
+/* Requires conn_lock to be locked */
+static GSList *
+get_all_connections (SoupSession *session)
+{
+	SoupSessionPrivate *priv = SOUP_SESSION_GET_PRIVATE (session);
+	GSList *conns = NULL, *host_conns;
+	GHashTableIter iter;
+	gpointer host;
+
+	g_hash_table_iter_init (&iter, priv->http_hosts);
+	while (g_hash_table_iter_next (&iter, NULL, &host)) {
+		host_conns = soup_session_host_get_connections (host);
+		conns = g_slist_concat (host_conns, conns);
+	}
+	g_hash_table_iter_init (&iter, priv->https_hosts);
+	while (g_hash_table_iter_next (&iter, NULL, &host)) {
+		host_conns = soup_session_host_get_connections (host);
+		conns = g_slist_concat (host_conns, conns);
+	}
+
+	return conns;
+}
+
 static gboolean
 soup_session_cleanup_connections (SoupSession *session,
 				  gboolean     cleanup_idle)
 {
 	SoupSessionPrivate *priv = SOUP_SESSION_GET_PRIVATE (session);
-	GSList *conns = NULL, *c;
-	GHashTableIter iter;
-	gpointer conn, host;
+	GSList *conns, *disconnect_conns, *c;
+	SoupConnection *conn;
 	SoupConnectionState state;
 
 	g_mutex_lock (&priv->conn_lock);
-	g_hash_table_iter_init (&iter, priv->conns);
-	while (g_hash_table_iter_next (&iter, &conn, &host)) {
+
+	conns = get_all_connections (session);
+	disconnect_conns = NULL;
+	for (c = conns; c; c = c->next) {
+		conn = c->data;
 		state = soup_connection_get_state (conn);
 		if (state == SOUP_CONNECTION_REMOTE_DISCONNECTED ||
 		    (cleanup_idle && state == SOUP_CONNECTION_IDLE)) {
-			conns = g_slist_prepend (conns, g_object_ref (conn));
-			g_hash_table_iter_remove (&iter);
-			drop_connection (session, host, conn);
-		}
+			disconnect_conns = g_slist_prepend (disconnect_conns, conn);
+			drop_connection (session, conn);
+		} else
+			g_object_unref (conn);
 	}
+	g_slist_free (conns);
 	g_mutex_unlock (&priv->conn_lock);
 
-	if (!conns)
+	if (!disconnect_conns)
 		return FALSE;
 
-	for (c = conns; c; c = c->next) {
+	for (c = disconnect_conns; c; c = c->next) {
 		conn = c->data;
 		soup_connection_disconnect (conn);
 		g_object_unref (conn);
 	}
-	g_slist_free (conns);
+	g_slist_free (disconnect_conns);
 
 	return TRUE;
 }
@@ -1361,17 +1382,11 @@ free_unused_host (SoupSessionHost *host,
 	g_mutex_unlock (&priv->conn_lock);
 }
 
+/* Requires conn_lock to be locked */
 static void
-drop_connection (SoupSession *session, SoupSessionHost *host, SoupConnection *conn)
+drop_connection (SoupSession *session, SoupConnection *conn)
 {
 	SoupSessionPrivate *priv = SOUP_SESSION_GET_PRIVATE (session);
-
-	/* Note: caller must hold conn_lock, and must remove @conn
-	 * from priv->conns itself.
-	 */
-
-	if (host)
-		soup_session_host_remove_connection (host, conn);
 
 	g_signal_handlers_disconnect_by_func (conn, connection_disconnected, session);
 	g_signal_handlers_disconnect_by_func (conn, connection_state_changed, session);
@@ -1385,14 +1400,10 @@ connection_disconnected (SoupConnection *conn, gpointer user_data)
 {
 	SoupSession *session = user_data;
 	SoupSessionPrivate *priv = SOUP_SESSION_GET_PRIVATE (session);
-	SoupSessionHost *host;
 
 	g_mutex_lock (&priv->conn_lock);
 
-	host = g_hash_table_lookup (priv->conns, conn);
-	if (host)
-		g_hash_table_remove (priv->conns, conn);
-	drop_connection (session, host, conn);
+	drop_connection (session, conn);
 
 	g_mutex_unlock (&priv->conn_lock);
 
@@ -1757,8 +1768,6 @@ get_connection_for_host (SoupSession *session,
 		 * conn_lock.
 		 */
 		g_signal_emit (session, signals[CONNECTION_CREATED], 0, conn);
-
-		g_hash_table_insert (priv->conns, conn, host);
 		priv->num_conns++;
 	}
 
@@ -2389,8 +2398,6 @@ soup_session_abort (SoupSession *session)
 {
 	SoupSessionPrivate *priv;
 	GSList *conns, *c;
-	GHashTableIter iter;
-	gpointer conn, host;
 
 	g_return_if_fail (SOUP_IS_SESSION (session));
 	priv = SOUP_SESSION_GET_PRIVATE (session);
@@ -2399,18 +2406,15 @@ soup_session_abort (SoupSession *session)
 
 	/* Close all idle connections */
 	g_mutex_lock (&priv->conn_lock);
-	conns = NULL;
-	g_hash_table_iter_init (&iter, priv->conns);
-	while (g_hash_table_iter_next (&iter, &conn, &host)) {
+	conns = get_all_connections (session);
+	for (c = conns; c; c = c->next) {
+		SoupConnection *conn = c->data;
 		SoupConnectionState state;
 
 		state = soup_connection_get_state (conn);
 		if (state == SOUP_CONNECTION_IDLE ||
-		    state == SOUP_CONNECTION_REMOTE_DISCONNECTED) {
-			conns = g_slist_prepend (conns, g_object_ref (conn));
-			g_hash_table_iter_remove (&iter);
-			drop_connection (session, host, conn);
-		}
+		    state == SOUP_CONNECTION_REMOTE_DISCONNECTED)
+			drop_connection (session, conn);
 	}
 	g_mutex_unlock (&priv->conn_lock);
 

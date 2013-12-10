@@ -19,6 +19,8 @@
 G_DEFINE_TYPE (SoupSessionHost, soup_session_host, G_TYPE_OBJECT)
 
 typedef struct {
+	GMutex       mutex;
+
 	SoupURI     *uri;
 	SoupAddress *addr;
 
@@ -47,6 +49,9 @@ static guint signals[LAST_SIGNAL] = { 0 };
 static void
 soup_session_host_init (SoupSessionHost *host)
 {
+	SoupSessionHostPrivate *priv = SOUP_SESSION_HOST_GET_PRIVATE (host);
+
+	g_mutex_init (&priv->mutex);
 }
 
 static void
@@ -63,6 +68,8 @@ soup_session_host_finalize (GObject *object)
 
 	soup_uri_free (priv->uri);
 	g_object_unref (priv->addr);
+
+	g_mutex_clear (&priv->mutex);
 
 	G_OBJECT_CLASS (soup_session_host_parent_class)->finalize (object);
 }
@@ -146,6 +153,30 @@ emit_unused (gpointer host)
 	return FALSE;
 }
 
+static void
+connection_disconnected (SoupConnection *conn, gpointer host)
+{
+	SoupSessionHostPrivate *priv = SOUP_SESSION_HOST_GET_PRIVATE (host);
+
+	g_mutex_lock (&priv->mutex);
+
+	if (soup_connection_get_ssl_fallback (conn))
+		priv->ssl_fallback = TRUE;
+
+	priv->connections = g_slist_remove (priv->connections, conn);
+	priv->num_conns--;
+
+	if (priv->num_conns == 0) {
+		g_assert (priv->keep_alive_src == NULL);
+		priv->keep_alive_src = soup_add_timeout_reffed (soup_session_get_async_context (priv->session),
+								HOST_KEEP_ALIVE,
+								emit_unused,
+								host);
+	}
+
+	g_mutex_unlock (&priv->mutex);
+}
+
 SoupConnection *
 soup_session_host_get_connection (SoupSessionHost *host,
 				  gboolean need_new_connection,
@@ -158,11 +189,14 @@ soup_session_host_get_connection (SoupSessionHost *host,
 	int num_pending = 0;
 	SoupSocketProperties *socket_props;
 
+	g_mutex_lock (&priv->mutex);
+
 	for (conns = priv->connections; conns; conns = conns->next) {
 		conn = conns->data;
 
 		if (!need_new_connection && soup_connection_get_state (conn) == SOUP_CONNECTION_IDLE) {
 			soup_connection_set_state (conn, SOUP_CONNECTION_IN_USE);
+			g_mutex_unlock (&priv->mutex);
 			return conn;
 		} else if (soup_connection_get_state (conn) == SOUP_CONNECTION_CONNECTING)
 			num_pending++;
@@ -171,17 +205,21 @@ soup_session_host_get_connection (SoupSessionHost *host,
 	/* Limit the number of pending connections; num_messages / 2
 	 * is somewhat arbitrary...
 	 */
-	if (num_pending > priv->num_messages / 2)
+	if (num_pending > priv->num_messages / 2) {
+		g_mutex_unlock (&priv->mutex);
 		return NULL;
+	}
 
 	if (priv->num_conns >= priv->max_conns) {
 		if (need_new_connection)
 			*try_cleanup = TRUE;
+		g_mutex_unlock (&priv->mutex);
 		return NULL;
 	}
 
 	if (at_max_conns) {
 		*try_cleanup = TRUE;
+		g_mutex_unlock (&priv->mutex);
 		return NULL;
 	}
 
@@ -198,40 +236,41 @@ soup_session_host_get_connection (SoupSessionHost *host,
 	priv->num_conns++;
 	priv->connections = g_slist_prepend (priv->connections, conn);
 
+	g_signal_connect (conn, "disconnected",
+			  G_CALLBACK (connection_disconnected),
+			  host);
+
 	if (priv->keep_alive_src) {
 		g_source_destroy (priv->keep_alive_src);
 		g_source_unref (priv->keep_alive_src);
 		priv->keep_alive_src = NULL;
 	}
 
+	g_mutex_unlock (&priv->mutex);
 	return conn;
-}
-
-void
-soup_session_host_remove_connection (SoupSessionHost *host,
-				     SoupConnection  *conn)
-{
-	SoupSessionHostPrivate *priv = SOUP_SESSION_HOST_GET_PRIVATE (host);
-
-	if (soup_connection_get_ssl_fallback (conn))
-		priv->ssl_fallback = TRUE;
-
-	priv->connections = g_slist_remove (priv->connections, conn);
-	priv->num_conns--;
-
-	if (priv->num_conns == 0) {
-		g_assert (priv->keep_alive_src == NULL);
-		priv->keep_alive_src = soup_add_timeout_reffed (soup_session_get_async_context (priv->session),
-								HOST_KEEP_ALIVE,
-								emit_unused,
-								host);
-	}
 }
 
 int
 soup_session_host_get_num_connections (SoupSessionHost *host)
 {
 	return SOUP_SESSION_HOST_GET_PRIVATE (host)->num_conns;
+}
+
+GSList *
+soup_session_host_get_connections (SoupSessionHost *host)
+{
+	SoupSessionHostPrivate *priv = SOUP_SESSION_HOST_GET_PRIVATE (host);
+	GSList *conns, *c;
+
+	g_mutex_lock (&priv->mutex);
+
+	conns = NULL;
+	for (c = priv->connections; c; c = c->next)
+		conns = g_slist_prepend (conns, g_object_ref (c->data));
+	conns = g_slist_reverse (conns);
+
+	g_mutex_unlock (&priv->mutex);
+	return conns;
 }
 
 gboolean
