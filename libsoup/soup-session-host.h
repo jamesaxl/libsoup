@@ -47,6 +47,11 @@ SoupConnection  *soup_session_host_get_connection      (SoupSessionHost      *ho
 int              soup_session_host_get_num_connections (SoupSessionHost      *host);
 GSList          *soup_session_host_get_connections     (SoupSessionHost      *host);
 
+gboolean         soup_session_host_cleanup_connections (SoupSessionHost      *host,
+							gboolean              cleanup_idle);
+
+void             soup_session_host_abort               (SoupSessionHost      *host);
+
 gboolean         soup_session_host_get_ssl_fallback    (SoupSessionHost      *host);
 void             soup_session_host_set_ssl_fallback    (SoupSessionHost      *host,
 							gboolean              ssl_fallback);

@@ -274,6 +274,66 @@ soup_session_host_get_connections (SoupSessionHost *host)
 }
 
 gboolean
+soup_session_host_cleanup_connections (SoupSessionHost *host,
+				       gboolean         cleanup_idle)
+{
+	SoupSessionHostPrivate *priv = SOUP_SESSION_HOST_GET_PRIVATE (host);
+	GSList *conns, *c, *next;
+	SoupConnection *conn;
+	SoupConnectionState state;
+
+	g_mutex_lock (&priv->mutex);
+	conns = NULL;
+	for (c = priv->connections; c; c = next) {
+		conn = c->data;
+		next = c->next;
+
+		state = soup_connection_get_state (conn);
+		if (state == SOUP_CONNECTION_REMOTE_DISCONNECTED ||
+		    (cleanup_idle && state == SOUP_CONNECTION_IDLE)) {
+			conns = g_slist_remove (conns, conn);
+			conns = g_slist_prepend (conns, g_object_ref (conn));
+		}
+	}
+	g_mutex_unlock (&priv->mutex);
+
+	if (!conns)
+		return FALSE;
+
+	for (c = conns; c; c = c->next) {
+		conn = c->data;
+		soup_connection_disconnect (conn);
+		g_object_unref (conn);
+	}
+	g_slist_free (conns);
+
+	return TRUE;
+}
+
+void
+soup_session_host_abort (SoupSessionHost *host)
+{
+	SoupSessionHostPrivate *priv = SOUP_SESSION_HOST_GET_PRIVATE (host);
+	GSList *conns, *c;
+
+	g_mutex_lock (&priv->mutex);
+	conns = priv->connections;
+	priv->connections = NULL;
+	g_mutex_unlock (&priv->mutex);
+
+	for (c = conns; c; c = c->next) {
+		SoupConnection *conn = c->data;
+		SoupConnectionState state;
+
+		state = soup_connection_get_state (conn);
+		if (state == SOUP_CONNECTION_IDLE ||
+		    state == SOUP_CONNECTION_REMOTE_DISCONNECTED)
+			soup_connection_disconnect (conn);
+	}
+	g_slist_free (conns);
+}
+
+gboolean
 soup_session_host_get_ssl_fallback (SoupSessionHost *host)
 {
 	return SOUP_SESSION_HOST_GET_PRIVATE (host)->ssl_fallback;

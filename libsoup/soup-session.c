@@ -1294,25 +1294,21 @@ soup_session_send_queue_item (SoupSession *session,
 
 /* Requires conn_lock to be locked */
 static GSList *
-get_all_connections (SoupSession *session)
+get_all_hosts (SoupSession *session)
 {
 	SoupSessionPrivate *priv = SOUP_SESSION_GET_PRIVATE (session);
-	GSList *conns = NULL, *host_conns;
+	GSList *hosts = NULL;
 	GHashTableIter iter;
 	gpointer host;
 
 	g_hash_table_iter_init (&iter, priv->http_hosts);
-	while (g_hash_table_iter_next (&iter, NULL, &host)) {
-		host_conns = soup_session_host_get_connections (host);
-		conns = g_slist_concat (host_conns, conns);
-	}
+	while (g_hash_table_iter_next (&iter, NULL, &host))
+		hosts = g_slist_prepend (hosts, g_object_ref (host));
 	g_hash_table_iter_init (&iter, priv->https_hosts);
-	while (g_hash_table_iter_next (&iter, NULL, &host)) {
-		host_conns = soup_session_host_get_connections (host);
-		conns = g_slist_concat (host_conns, conns);
-	}
+	while (g_hash_table_iter_next (&iter, NULL, &host))
+		hosts = g_slist_prepend (hosts, g_object_ref (host));
 
-	return conns;
+	return hosts;
 }
 
 static gboolean
@@ -1320,38 +1316,23 @@ soup_session_cleanup_connections (SoupSession *session,
 				  gboolean     cleanup_idle)
 {
 	SoupSessionPrivate *priv = SOUP_SESSION_GET_PRIVATE (session);
-	GSList *conns, *disconnect_conns, *c;
-	SoupConnection *conn;
-	SoupConnectionState state;
+	GSList *hosts, *h;
+	SoupSessionHost *host;
+	gboolean cleaned_any = FALSE;
 
 	g_mutex_lock (&priv->conn_lock);
-
-	conns = get_all_connections (session);
-	disconnect_conns = NULL;
-	for (c = conns; c; c = c->next) {
-		conn = c->data;
-		state = soup_connection_get_state (conn);
-		if (state == SOUP_CONNECTION_REMOTE_DISCONNECTED ||
-		    (cleanup_idle && state == SOUP_CONNECTION_IDLE)) {
-			disconnect_conns = g_slist_prepend (disconnect_conns, conn);
-			drop_connection (session, conn);
-		} else
-			g_object_unref (conn);
-	}
-	g_slist_free (conns);
+	hosts = get_all_hosts (session);
 	g_mutex_unlock (&priv->conn_lock);
 
-	if (!disconnect_conns)
-		return FALSE;
-
-	for (c = disconnect_conns; c; c = c->next) {
-		conn = c->data;
-		soup_connection_disconnect (conn);
-		g_object_unref (conn);
+	for (h = hosts; h; h = h->next) {
+		host = h->data;
+		if (soup_session_host_cleanup_connections (host, cleanup_idle))
+			cleaned_any = TRUE;
+		g_object_unref (host);
 	}
-	g_slist_free (disconnect_conns);
+	g_slist_free (hosts);
 
-	return TRUE;
+	return cleaned_any;
 }
 
 static void
@@ -2397,7 +2378,8 @@ void
 soup_session_abort (SoupSession *session)
 {
 	SoupSessionPrivate *priv;
-	GSList *conns, *c;
+	GSList *hosts, *h;
+	SoupSessionHost *host;
 
 	g_return_if_fail (SOUP_IS_SESSION (session));
 	priv = SOUP_SESSION_GET_PRIVATE (session);
@@ -2406,24 +2388,15 @@ soup_session_abort (SoupSession *session)
 
 	/* Close all idle connections */
 	g_mutex_lock (&priv->conn_lock);
-	conns = get_all_connections (session);
-	for (c = conns; c; c = c->next) {
-		SoupConnection *conn = c->data;
-		SoupConnectionState state;
-
-		state = soup_connection_get_state (conn);
-		if (state == SOUP_CONNECTION_IDLE ||
-		    state == SOUP_CONNECTION_REMOTE_DISCONNECTED)
-			drop_connection (session, conn);
-	}
+	hosts = get_all_hosts (session);
 	g_mutex_unlock (&priv->conn_lock);
 
-	for (c = conns; c; c = c->next) {
-		soup_connection_disconnect (c->data);
-		g_object_unref (c->data);
+	for (h = hosts; h; h = h->next) {
+		host = h->data;
+		soup_session_host_abort (host);
+		g_object_unref (host);
 	}
-
-	g_slist_free (conns);
+	g_slist_free (hosts);
 }
 
 static void
