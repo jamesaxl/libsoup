@@ -12,6 +12,7 @@
 #include "soup-session-host.h"
 #include "soup.h"
 #include "soup-connection.h"
+#include "soup-message-queue.h"
 #include "soup-misc-private.h"
 #include "soup-session-private.h"
 #include "soup-socket-private.h"
@@ -23,6 +24,8 @@ typedef struct {
 
 	SoupURI     *uri;
 	SoupAddress *addr;
+
+	SoupMessageQueue *queue;
 
 	GSList      *connections;      /* CONTAINS: SoupConnection */
 	guint        num_conns;
@@ -52,6 +55,8 @@ soup_session_host_init (SoupSessionHost *host)
 	SoupSessionHostPrivate *priv = SOUP_SESSION_HOST_GET_PRIVATE (host);
 
 	g_mutex_init (&priv->mutex);
+
+	priv->queue = soup_message_queue_new ();
 }
 
 static void
@@ -68,6 +73,8 @@ soup_session_host_finalize (GObject *object)
 
 	soup_uri_free (priv->uri);
 	g_object_unref (priv->addr);
+
+	soup_message_queue_destroy (priv->queue);
 
 	g_mutex_clear (&priv->mutex);
 
@@ -133,17 +140,79 @@ soup_session_host_get_address (SoupSessionHost *host)
 }
 
 void
-soup_session_host_add_message (SoupSessionHost *host,
-			       SoupMessage     *msg)
+soup_session_host_run_queue (SoupSessionHost *host,
+			     gboolean        *should_cleanup)
 {
-	SOUP_SESSION_HOST_GET_PRIVATE (host)->num_messages++;
+	SoupSessionHostPrivate *priv = SOUP_SESSION_HOST_GET_PRIVATE (host);
+	SoupMessageQueueItem *item;
+	SoupMessage *msg;
+
+	g_object_ref (host);
+	soup_session_host_cleanup_connections (host, FALSE);
+
+	for (item = soup_message_queue_first (priv->queue);
+	     item;
+	     item = soup_message_queue_next (priv->queue, item)) {
+		msg = item->msg;
+
+		/* CONNECT messages are handled specially */
+		if (msg->method == SOUP_METHOD_CONNECT)
+			continue;
+
+		if (!item->async ||
+		    item->async_context != soup_session_get_async_context (priv->session))
+			continue;
+
+		soup_session_process_queue_item (priv->session, item, should_cleanup, TRUE);
+	}
+
+	g_object_unref (host);
+}
+
+GSList *
+soup_session_host_get_queue_items (SoupSessionHost *host)
+{
+	SoupSessionHostPrivate *priv = SOUP_SESSION_HOST_GET_PRIVATE (host);
+	SoupMessageQueueItem *item;
+	GSList *items = NULL;
+
+	for (item = soup_message_queue_first (priv->queue);
+	     item;
+	     item = soup_message_queue_next (priv->queue, item)) {
+		soup_message_queue_item_ref (item);
+		items = g_slist_prepend (items, item);
+	}
+
+	return items;
 }
 
 void
-soup_session_host_remove_message (SoupSessionHost *host,
-				  SoupMessage     *msg)
+soup_session_host_add_queue_item (SoupSessionHost      *host,
+				  SoupMessageQueueItem *item)
 {
-	SOUP_SESSION_HOST_GET_PRIVATE (host)->num_messages--;
+	SoupSessionHostPrivate *priv = SOUP_SESSION_HOST_GET_PRIVATE (host);
+
+	priv->num_messages++;
+	soup_message_queue_append (priv->queue, item);
+}
+
+SoupMessageQueueItem *
+soup_session_host_lookup_queue_item (SoupSessionHost *host,
+				     SoupMessage     *msg)
+{
+	SoupSessionHostPrivate *priv = SOUP_SESSION_HOST_GET_PRIVATE (host);
+
+	return soup_message_queue_lookup (priv->queue, msg);
+}
+
+void
+soup_session_host_remove_item (SoupSessionHost      *host,
+			       SoupMessageQueueItem *item)
+{
+	SoupSessionHostPrivate *priv = SOUP_SESSION_HOST_GET_PRIVATE (host);
+
+	soup_message_queue_remove (priv->queue, item);
+	priv->num_messages--;
 }
 
 static gboolean

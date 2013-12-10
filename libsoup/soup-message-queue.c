@@ -34,12 +34,11 @@ struct _SoupMessageQueue {
 };
 
 SoupMessageQueue *
-soup_message_queue_new (SoupSession *session)
+soup_message_queue_new (void)
 {
 	SoupMessageQueue *queue;
 
 	queue = g_slice_new0 (SoupMessageQueue);
-	queue->session = session;
 	g_mutex_init (&queue->mutex);
 	return queue;
 }
@@ -62,29 +61,30 @@ queue_message_restarted (SoupMessage *msg, gpointer user_data)
 }
 
 /**
- * soup_message_queue_append:
- * @queue: a #SoupMessageQueue
+ * soup_message_queue_item_new:
+ * @session: the #SoupSession that will own the item
  * @msg: a #SoupMessage
  * @callback: the callback for @msg
  * @user_data: the data to pass to @callback
  *
- * Creates a new #SoupMessageQueueItem and appends it to @queue.
+ * Creates a new #SoupMessageQueueItem for @msg.
  *
  * Return value: the new item, which you must unref with
  * soup_message_queue_unref_item() when you are done with.
  **/
 SoupMessageQueueItem *
-soup_message_queue_append (SoupMessageQueue *queue, SoupMessage *msg,
-			   SoupSessionCallback callback, gpointer user_data)
+soup_message_queue_item_new (SoupSession         *session,
+			     SoupMessage         *msg,
+			     SoupSessionCallback  callback,
+			     gpointer             user_data)
 {
 	SoupMessageQueueItem *item;
 
 	item = g_slice_new0 (SoupMessageQueueItem);
-	item->session = g_object_ref (queue->session);
+	item->session = g_object_ref (session);
 	item->async_context = soup_session_get_async_context (item->session);
 	if (item->async_context)
 		g_main_context_ref (item->async_context);
-	item->queue = queue;
 	item->msg = g_object_ref (msg);
 	item->callback = callback;
 	item->callback_data = user_data;
@@ -94,11 +94,26 @@ soup_message_queue_append (SoupMessageQueue *queue, SoupMessage *msg,
 	g_signal_connect (msg, "restarted",
 			  G_CALLBACK (queue_message_restarted), item);
 
-	/* Note: the initial ref_count of 1 represents the caller's
-	 * ref; the queue's own ref is indicated by the absence of the
-	 * "removed" flag.
-	 */
 	item->ref_count = 1;
+	item->removed = TRUE;
+
+	return item;
+}
+
+/**
+ * soup_message_queue_append:
+ * @queue: a #SoupMessageQueue
+ * @item: a #SoupMessageQueueItem
+ *
+ * Appends @item to @queue.
+ **/
+void
+soup_message_queue_append (SoupMessageQueue     *queue,
+			   SoupMessageQueueItem *item)
+{
+	g_return_if_fail (item->removed == TRUE);
+
+	item->removed = FALSE;
 
 	g_mutex_lock (&queue->mutex);
 	if (queue->head) {
@@ -127,7 +142,6 @@ soup_message_queue_append (SoupMessageQueue *queue, SoupMessage *msg,
 		queue->head = queue->tail = item;
 
 	g_mutex_unlock (&queue->mutex);
-	return item;
 }
 
 /**

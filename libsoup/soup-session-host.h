@@ -35,10 +35,16 @@ SoupSessionHost *soup_session_host_new                 (SoupSession          *se
 SoupURI         *soup_session_host_get_uri             (SoupSessionHost      *host);
 SoupAddress     *soup_session_host_get_address         (SoupSessionHost      *host);
 
-void             soup_session_host_add_message         (SoupSessionHost      *host,
-							SoupMessage          *msg);
-void             soup_session_host_remove_message      (SoupSessionHost      *host,
-							SoupMessage          *msg);
+void                  soup_session_host_add_queue_item      (SoupSessionHost      *host,
+							     SoupMessageQueueItem *item);
+SoupMessageQueueItem *soup_session_host_lookup_queue_item   (SoupSessionHost      *host,
+							     SoupMessage          *msg);
+void                  soup_session_host_run_queue           (SoupSessionHost      *host,
+							     gboolean             *should_cleanup);
+GSList               *soup_session_host_get_queue_items     (SoupSessionHost      *host);
+
+void                  soup_session_host_remove_item         (SoupSessionHost      *host,
+							     SoupMessageQueueItem *item);
 
 SoupConnection  *soup_session_host_get_connection      (SoupSessionHost      *host,
 							gboolean              need_new_connection,

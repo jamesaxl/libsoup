@@ -10,6 +10,7 @@
 #include "soup-connection.h"
 #include "soup-message.h"
 #include "soup-session.h"
+#include "soup-session-host.h"
 
 G_BEGIN_DECLS
 
@@ -40,6 +41,7 @@ struct _SoupMessageQueueItem {
 	GCancellable *cancellable;
 	GError *error;
 
+	SoupSessionHost *host;
 	SoupConnection *conn;
 	GTask *task;
 	GSource *io_source;
@@ -60,20 +62,23 @@ struct _SoupMessageQueueItem {
 	SoupMessageQueueItem *related;
 };
 
-SoupMessageQueue     *soup_message_queue_new        (SoupSession          *session);
-SoupMessageQueueItem *soup_message_queue_append     (SoupMessageQueue     *queue,
+SoupMessageQueue     *soup_message_queue_new        (void);
+
+SoupMessageQueueItem *soup_message_queue_item_new   (SoupSession          *session,
 						     SoupMessage          *msg,
 						     SoupSessionCallback   callback,
 						     gpointer              user_data);
+
+void                  soup_message_queue_append     (SoupMessageQueue     *queue,
+						     SoupMessageQueueItem *item);
+void                  soup_message_queue_remove     (SoupMessageQueue     *queue,
+						     SoupMessageQueueItem *item);
 
 SoupMessageQueueItem *soup_message_queue_lookup     (SoupMessageQueue     *queue,
 						     SoupMessage          *msg);
 
 SoupMessageQueueItem *soup_message_queue_first      (SoupMessageQueue     *queue);
 SoupMessageQueueItem *soup_message_queue_next       (SoupMessageQueue     *queue,
-						     SoupMessageQueueItem *item);
-
-void                  soup_message_queue_remove     (SoupMessageQueue     *queue,
 						     SoupMessageQueueItem *item);
 
 void                  soup_message_queue_destroy    (SoupMessageQueue     *queue);

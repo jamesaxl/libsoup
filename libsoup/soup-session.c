@@ -107,8 +107,6 @@ typedef struct {
 
 	SoupSocketProperties *socket_props;
 
-	SoupMessageQueue *queue;
-
 	char *user_agent;
 	char *accept_language;
 	gboolean accept_language_auto;
@@ -216,8 +214,6 @@ soup_session_init (SoupSession *session)
 	SoupAuthManager *auth_manager;
 
 	priv->session = session;
-
-	priv->queue = soup_message_queue_new (session);
 
 	g_mutex_init (&priv->conn_lock);
 	g_cond_init (&priv->conn_cond);
@@ -327,8 +323,6 @@ soup_session_finalize (GObject *object)
 {
 	SoupSession *session = SOUP_SESSION (object);
 	SoupSessionPrivate *priv = SOUP_SESSION_GET_PRIVATE (session);
-
-	soup_message_queue_destroy (priv->queue);
 
 	g_mutex_clear (&priv->conn_lock);
 	g_cond_clear (&priv->conn_cond);
@@ -1186,11 +1180,16 @@ re_emit_connection_event (SoupConnection      *conn,
 static void
 soup_session_set_item_connection (SoupSession          *session,
 				  SoupMessageQueueItem *item,
+				  SoupSessionHost      *host,
 				  SoupConnection       *conn)
 {
 	if (item->conn) {
 		g_signal_handlers_disconnect_by_func (item->conn, re_emit_connection_event, item);
 		g_object_unref (item->conn);
+	}
+	if (item->host && item->host != host) {
+		soup_session_host_remove_item (item->host, item);
+		item->host = NULL;
 	}
 
 	item->conn = conn;
@@ -1200,6 +1199,11 @@ soup_session_set_item_connection (SoupSession          *session,
 		g_object_ref (item->conn);
 		g_signal_connect (item->conn, "event",
 				  G_CALLBACK (re_emit_connection_event), item);
+	}
+
+	if (!item->host) {
+		item->host = host;
+		soup_session_host_add_queue_item (host, item);
 	}
 }
 
@@ -1213,7 +1217,7 @@ message_restarted (SoupMessage *msg, gpointer user_data)
 	     SOUP_STATUS_IS_REDIRECTION (msg->status_code))) {
 		if (soup_connection_get_state (item->conn) == SOUP_CONNECTION_IN_USE)
 			soup_connection_set_state (item->conn, SOUP_CONNECTION_IDLE);
-		soup_session_set_item_connection (item->session, item, NULL);
+		soup_session_set_item_connection (item->session, item, NULL, NULL);
 	}
 
 	soup_message_cleanup_response (msg);
@@ -1230,13 +1234,13 @@ soup_session_append_queue_item (SoupSession *session, SoupMessage *msg,
 
 	soup_message_cleanup_response (msg);
 
-	item = soup_message_queue_append (priv->queue, msg, callback, user_data);
+	item = soup_message_queue_item_new (session, msg, callback, user_data);
 	item->async = async;
 	item->new_api = new_api;
 
 	g_mutex_lock (&priv->conn_lock);
 	host = get_host_for_message (session, item->msg);
-	soup_session_host_add_message (host, msg);
+	soup_session_host_add_queue_item (host, item);
 	g_mutex_unlock (&priv->conn_lock);
 
 	if (!(soup_message_get_flags (msg) & SOUP_MESSAGE_NO_REDIRECT)) {
@@ -1406,8 +1410,18 @@ soup_session_lookup_queue_item (SoupSession *session,
 				SoupMessage *msg)
 {
 	SoupSessionPrivate *priv = SOUP_SESSION_GET_PRIVATE (session);
+	GSList *hosts, *h;
+	SoupMessageQueueItem *item = NULL;
 
-	return soup_message_queue_lookup (priv->queue, msg);
+	g_mutex_lock (&priv->conn_lock);
+	hosts = get_all_hosts (session);
+	g_mutex_unlock (&priv->conn_lock);
+
+	for (h = hosts; h && !item; h = h->next)
+		item = soup_session_host_lookup_queue_item (h->data, msg);
+
+	g_slist_free_full (hosts, g_object_unref);
+	return item;
 }
 
 static void
@@ -1421,7 +1435,7 @@ soup_session_unqueue_item (SoupSession          *session,
 		if (item->msg->method != SOUP_METHOD_CONNECT ||
 		    !SOUP_STATUS_IS_SUCCESSFUL (item->msg->status_code))
 			soup_connection_set_state (item->conn, SOUP_CONNECTION_IDLE);
-		soup_session_set_item_connection (session, item, NULL);
+		soup_session_set_item_connection (session, item, NULL, NULL);
 	}
 
 	if (item->state != SOUP_MESSAGE_FINISHED) {
@@ -1429,11 +1443,9 @@ soup_session_unqueue_item (SoupSession          *session,
 		return;
 	}
 
-	soup_message_queue_remove (priv->queue, item);
-
 	g_mutex_lock (&priv->conn_lock);
 	host = get_host_for_message (session, item->msg);
-	soup_session_host_remove_message (host, item->msg);
+	soup_session_host_remove_item (host, item);
 	g_cond_broadcast (&priv->conn_cond);
 	g_mutex_unlock (&priv->conn_lock);
 
@@ -1574,7 +1586,7 @@ tunnel_complete (SoupMessageQueueItem *tunnel_item,
 		status = status_from_connect_error (item, error);
 	if (!SOUP_STATUS_IS_SUCCESSFUL (status)) {
 		soup_connection_disconnect (item->conn);
-		soup_session_set_item_connection (session, item, NULL);
+		soup_session_set_item_connection (session, item, NULL, NULL);
 		if (!item->new_api || item->msg->status_code == 0)
 			soup_session_set_item_status (session, item, status, error);
 	}
@@ -1659,7 +1671,7 @@ tunnel_connect (SoupMessageQueueItem *item)
 	g_object_unref (msg);
 	tunnel_item->related = item;
 	soup_message_queue_item_ref (item);
-	soup_session_set_item_connection (session, tunnel_item, item->conn);
+	soup_session_set_item_connection (session, tunnel_item, item->host, item->conn);
 	tunnel_item->state = SOUP_MESSAGE_RUNNING;
 
 	g_signal_emit (session, signals[TUNNELING], 0, tunnel_item->conn);
@@ -1687,7 +1699,7 @@ connect_complete (SoupMessageQueueItem *item, SoupConnection *conn, GError *erro
 	if (item->state == SOUP_MESSAGE_CONNECTING) {
 		if (!item->new_api || item->msg->status_code == 0)
 			soup_session_set_item_status (session, item, status, error);
-		soup_session_set_item_connection (session, item, NULL);
+		soup_session_set_item_connection (session, item, NULL, NULL);
 		item->state = SOUP_MESSAGE_READY;
 	}
 }
@@ -1800,7 +1812,7 @@ get_connection (SoupMessageQueueItem *item, gboolean *should_cleanup)
 		return FALSE;
 	}
 
-	soup_session_set_item_connection (session, item, conn);
+	soup_session_set_item_connection (session, item, host, conn);
 
 	if (soup_connection_get_state (item->conn) != SOUP_CONNECTION_NEW) {
 		item->state = SOUP_MESSAGE_READY;
@@ -1917,29 +1929,19 @@ static void
 async_run_queue (SoupSession *session)
 {
 	SoupSessionPrivate *priv = SOUP_SESSION_GET_PRIVATE (session);
-	SoupMessageQueueItem *item;
-	SoupMessage *msg;
 	gboolean try_cleanup = TRUE, should_cleanup = FALSE;
+	GSList *hosts, *h;
 
 	g_object_ref (session);
 	soup_session_cleanup_connections (session, FALSE);
 
+	g_mutex_lock (&priv->conn_lock);
+	hosts = get_all_hosts (session);
+	g_mutex_unlock (&priv->conn_lock);
+
  try_again:
-	for (item = soup_message_queue_first (priv->queue);
-	     item;
-	     item = soup_message_queue_next (priv->queue, item)) {
-		msg = item->msg;
-
-		/* CONNECT messages are handled specially */
-		if (msg->method == SOUP_METHOD_CONNECT)
-			continue;
-
-		if (!item->async ||
-		    item->async_context != soup_session_get_async_context (session))
-			continue;
-
-		soup_session_process_queue_item (session, item, &should_cleanup, TRUE);
-	}
+	for (h = hosts; h; h = hosts->next)
+		soup_session_host_run_queue (h->data, &should_cleanup);
 
 	if (try_cleanup && should_cleanup) {
 		/* There is at least one message in the queue that
@@ -1952,6 +1954,7 @@ async_run_queue (SoupSession *session)
 		}
 	}
 
+	g_slist_free_full (hosts, g_object_unref);
 	g_object_unref (session);
 }
 
@@ -2158,19 +2161,42 @@ soup_session_pause_message (SoupSession *session,
 	soup_message_queue_item_unref (item);
 }
 
+static GSList *
+get_all_queue_items (SoupSession *session)
+{
+	GSList *hosts, *h, *items, *host_items;
+
+	hosts = get_all_hosts (session);
+
+	items = NULL;
+	for (h = hosts; h; h = h->next) {
+		host_items = soup_session_host_get_queue_items (h->data);
+		items = g_slist_concat (host_items, items);
+	}
+
+	g_slist_free_full (hosts, g_object_unref);
+
+	return items;
+}
+
 static void
 soup_session_real_kick_queue (SoupSession *session)
 {
 	SoupSessionPrivate *priv = SOUP_SESSION_GET_PRIVATE (session);
+	GSList *items, *i;
 	SoupMessageQueueItem *item;
 	gboolean have_sync_items = FALSE;
 
 	if (priv->disposed)
 		return;
 
-	for (item = soup_message_queue_first (priv->queue);
-	     item;
-	     item = soup_message_queue_next (priv->queue, item)) {
+	g_mutex_lock (&priv->conn_lock);
+	items = get_all_queue_items (session);
+	g_mutex_unlock (&priv->conn_lock);
+
+	for (i = items; i; i = i->next) {
+		item = i->data;
+
 		if (item->async) {
 			GSource *source;
 
@@ -2189,6 +2215,7 @@ soup_session_real_kick_queue (SoupSession *session)
 		} else
 			have_sync_items = TRUE;
 	}
+	g_slist_free_full (items, (GDestroyNotify) soup_message_queue_item_unref);
 
 	if (have_sync_items) {
 		g_mutex_lock (&priv->conn_lock);
@@ -2312,26 +2339,29 @@ static void
 soup_session_real_flush_queue (SoupSession *session)
 {
 	SoupSessionPrivate *priv = SOUP_SESSION_GET_PRIVATE (session);
+	GSList *items, *i;
 	SoupMessageQueueItem *item;
 	GHashTable *current = NULL;
 	gboolean done = FALSE;
 
+	g_mutex_lock (&priv->conn_lock);
+	items = get_all_queue_items (session);
+	g_mutex_unlock (&priv->conn_lock);
+
 	if (SOUP_IS_SESSION_SYNC (session)) {
 		/* Record the current contents of the queue */
 		current = g_hash_table_new (NULL, NULL);
-		for (item = soup_message_queue_first (priv->queue);
-		     item;
-		     item = soup_message_queue_next (priv->queue, item))
-			g_hash_table_insert (current, item, item);
+		for (i = items; i; i = i->next)
+			g_hash_table_insert (current, i->data, i->data);
 	}
 
 	/* Cancel everything */
-	for (item = soup_message_queue_first (priv->queue);
-	     item;
-	     item = soup_message_queue_next (priv->queue, item)) {
+	for (i = items; i; i = i->next) {
+		item = i->data;
 		soup_session_cancel_message (session, item->msg,
 					     SOUP_STATUS_CANCELLED);
 	}
+	g_slist_free_full (items, (GDestroyNotify) soup_message_queue_item_unref);
 
 	if (SOUP_IS_SESSION_SYNC (session)) {
 		/* Wait until all of the items in @current have been
@@ -2345,12 +2375,14 @@ soup_session_real_flush_queue (SoupSession *session)
 		g_mutex_lock (&priv->conn_lock);
 		do {
 			done = TRUE;
-			for (item = soup_message_queue_first (priv->queue);
-			     item;
-			     item = soup_message_queue_next (priv->queue, item)) {
-				if (g_hash_table_lookup (current, item))
+			items = get_all_queue_items (session);
+			for (i = items; i; i = i->next) {
+				if (g_hash_table_lookup (current, i->data)) {
 					done = FALSE;
+					break;
+				}
 			}
+			g_slist_free_full (items, (GDestroyNotify) soup_message_queue_item_unref);
 
 			if (!done)
 				g_cond_wait (&priv->conn_cond, &priv->conn_lock);
